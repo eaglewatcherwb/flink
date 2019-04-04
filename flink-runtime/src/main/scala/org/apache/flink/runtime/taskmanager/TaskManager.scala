@@ -40,7 +40,7 @@ import org.apache.flink.runtime.broadcast.BroadcastVariableManager
 import org.apache.flink.runtime.clusterframework.BootstrapTools
 import org.apache.flink.runtime.clusterframework.messages.StopCluster
 import org.apache.flink.runtime.clusterframework.types.{AllocationID, ResourceID}
-import org.apache.flink.runtime.concurrent.{Executors, FutureUtils}
+import org.apache.flink.runtime.concurrent.Executors
 import org.apache.flink.runtime.deployment.TaskDeploymentDescriptor
 import org.apache.flink.runtime.execution.ExecutionState
 import org.apache.flink.runtime.execution.librarycache.{BlobLibraryCacheManager, LibraryCacheManager}
@@ -48,11 +48,12 @@ import org.apache.flink.runtime.executiongraph.{ExecutionAttemptID, PartitionInf
 import org.apache.flink.runtime.filecache.FileCache
 import org.apache.flink.runtime.highavailability.HighAvailabilityServicesUtils.AddressResolution
 import org.apache.flink.runtime.highavailability.{HighAvailabilityServices, HighAvailabilityServicesUtils}
-import org.apache.flink.runtime.instance.{ActorGateway, AkkaActorGateway, HardwareDescription, InstanceID}
+import org.apache.flink.runtime.instance.{AkkaActorGateway, HardwareDescription, InstanceID}
 import org.apache.flink.runtime.io.disk.iomanager.IOManager
 import org.apache.flink.runtime.io.network.{NetworkEnvironment, TaskEventDispatcher}
 import org.apache.flink.runtime.io.network.netty.PartitionProducerStateChecker
 import org.apache.flink.runtime.io.network.partition.ResultPartitionConsumableNotifier
+import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate
 import org.apache.flink.runtime.leaderretrieval.{LeaderRetrievalListener, LeaderRetrievalService}
 import org.apache.flink.runtime.memory.MemoryManager
 import org.apache.flink.runtime.messages.Messages._
@@ -1295,28 +1296,30 @@ class TaskManager(
 
           val resultID = info.getIntermediateDataSetID
           val partitionInfo = info.getInputChannelDeploymentDescriptor
-          val reader = task.getInputGateById(resultID)
+          val readers: util.Set[SingleInputGate] = task.getInputGateById(resultID)
 
-          if (reader != null) {
-            Future {
-              try {
-                reader.updateInputChannel(partitionInfo)
-              }
-              catch {
-                case t: Throwable =>
-                  log.error(s"Could not update input data location for task " +
-                    s"${task.getTaskInfo.getTaskName}. Trying to fail  task.", t)
+          if (readers != null) {
+            for (reader <- readers.asScala) {
+              Future {
+                try {
+                  reader.updateInputChannel(partitionInfo)
+                }
+                catch {
+                  case t: Throwable =>
+                    log.error(s"Could not update input data location for task " +
+                      s"${task.getTaskInfo.getTaskName}. Trying to fail  task.", t)
 
-                  try {
-                    task.failExternally(t)
-                  }
-                  catch {
-                    case t: Throwable =>
-                      log.error("Failed canceling task with execution ID " + executionId +
-                        " after task update failure.", t)
-                  }
-              }
-            }(context.dispatcher)
+                    try {
+                      task.failExternally(t)
+                    }
+                    catch {
+                      case t: Throwable =>
+                        log.error("Failed canceling task with execution ID " + executionId +
+                          " after task update failure.", t)
+                    }
+                }
+              }(context.dispatcher)
+            }
             None
           }
           else {

@@ -179,6 +179,8 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 
 	private LinkedHashSet<Class<?>> registeredPojoTypes = new LinkedHashSet<>();
 
+	private boolean enableAdaptiveParallelism = false;
+
 	// --------------------------------------------------------------------------------------------
 
 	/**
@@ -505,6 +507,14 @@ public class ExecutionConfig implements Serializable, Archiveable<ArchivedExecut
 	 */
 	public void setExecutionMode(ExecutionMode executionMode) {
 		this.executionMode = executionMode;
+	}
+
+	public void setEnableAdaptiveParallelism(boolean enableAdaptiveParallelism) {
+		this.enableAdaptiveParallelism = enableAdaptiveParallelism;
+	}
+
+	public boolean getEnableAdaptiveParallelism() {
+		return this.enableAdaptiveParallelism;
 	}
 
 	/**

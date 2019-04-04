@@ -781,24 +781,39 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 			return;
 		}
 
+
 		for (ExecutionEdge edge : allConsumers.get(0)) {
-			final ExecutionVertex consumerVertex = edge.getTarget();
+			ExecutionVertex consumerVertex = edge.getTarget();
+			final ExecutionJobVertex consumerJobVertex = consumerVertex.getJobVertex();
+
+			//get the real consumer vertex
+			consumerVertex = consumerJobVertex.getTaskVertices()[consumerJobVertex.getOriginIndexToTarget(consumerVertex.getParallelSubtaskIndex())];
 
 			final Execution consumer = consumerVertex.getCurrentExecutionAttempt();
 			final ExecutionState consumerState = consumer.getState();
 
 			final IntermediateResultPartition partition = edge.getSource();
 
+			consumerJobVertex.computeAdaptiveParallelism();
+
+			if (consumerVertex.isAdaptiveCancelled()) {
+				LOG.debug("{} ignore schedule due to cancelled by dp.", consumerVertex.getTaskNameWithSubtaskIndex());
+				continue;
+			}
+
 			// ----------------------------------------------------------------
 			// Consumer is created => try to deploy and cache input channel
 			// descriptors if there is a deployment race
 			// ----------------------------------------------------------------
+			final ExecutionVertex producerExecutionVertex = partition.getProducer();
+			if (producerExecutionVertex.isAdaptiveCancelled()) {
+				LOG.debug("{} ignore schedule due to producer execution {} is cancelled by dp",
+					consumerVertex.getTaskNameWithSubtaskIndex(), producerExecutionVertex.getTaskNameWithSubtaskIndex());
+				continue;
+			}
 			if (consumerState == CREATED) {
-				final Execution partitionExecution = partition.getProducer()
-						.getCurrentExecutionAttempt();
-
 				consumerVertex.cachePartitionInfo(PartialInputChannelDeploymentDescriptor.fromEdge(
-						partition, partitionExecution));
+						partition, producerExecutionVertex.getCurrentExecutionAttempt()));
 
 				// When deploying a consuming task, its task deployment descriptor will contain all
 				// deployment information available at the respective time. It is possible that some
@@ -873,11 +888,8 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 				// deployment descriptors and send update message later
 				// ----------------------------------------------------------------
 				else if (consumerState == SCHEDULED || consumerState == DEPLOYING) {
-					final Execution partitionExecution = partition.getProducer()
-							.getCurrentExecutionAttempt();
-
 					consumerVertex.cachePartitionInfo(PartialInputChannelDeploymentDescriptor
-							.fromEdge(partition, partitionExecution));
+							.fromEdge(partition, producerExecutionVertex.getCurrentExecutionAttempt()));
 
 					// double check to resolve race conditions
 					if (consumerVertex.getExecutionState() == RUNNING) {
@@ -1007,6 +1019,8 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 
 				if (transitionState(current, FINISHED)) {
 					try {
+						updateAccumulatorsAndMetrics(userAccumulators, metrics);
+
 						for (IntermediateResultPartition finishedPartition
 								: getVertex().finishAllBlockingPartitions()) {
 
@@ -1017,8 +1031,6 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 								scheduleOrUpdateConsumers(partition.getConsumers());
 							}
 						}
-
-						updateAccumulatorsAndMetrics(userAccumulators, metrics);
 
 						releaseAssignedResource(null);
 
@@ -1500,6 +1512,10 @@ public class Execution implements AccessExecution, Archiveable<ArchivedExecution
 		if (metrics != null) {
 			this.ioMetrics = metrics;
 		}
+	}
+
+	boolean alreadyDeployed() {
+		return DEPLOYING.equals(state) || RUNNING.equals(state);
 	}
 
 	// ------------------------------------------------------------------------

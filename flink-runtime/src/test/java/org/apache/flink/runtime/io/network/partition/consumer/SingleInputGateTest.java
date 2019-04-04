@@ -352,7 +352,7 @@ public class SingleInputGateTest {
 			netEnv,
 			new TaskEventDispatcher(),
 			new NoOpTaskActions(),
-			UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup());
+			UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup())[0];
 
 		try {
 			assertEquals(gateDesc.getConsumedPartitionType(), gate.getConsumedPartitionType());
@@ -533,6 +533,101 @@ public class SingleInputGateTest {
 		} finally {
 			inputGate.close();
 			network.shutdown();
+		}
+	}
+
+	/**
+	 * Tests for FLINK-12002.
+	 *
+	 * @see <a href="https://issues.apache.org/jira/browse/FLINK-12002">FLINK-12002</a>
+	 */
+	@Test
+	public void testMultipleConsumedPartitionIndex() throws Exception {
+		ResultPartitionID[] partitionIds = new ResultPartitionID[] {
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID(),
+			new ResultPartitionID()
+		};
+
+		InputChannelDeploymentDescriptor[] channelDesc = new InputChannelDeploymentDescriptor[]{
+			// Local
+			new InputChannelDeploymentDescriptor(
+				partitionIds[0],
+				ResultPartitionLocation.createLocal()),
+			// Remote
+			new InputChannelDeploymentDescriptor(
+				partitionIds[1],
+				ResultPartitionLocation.createRemote(new ConnectionID(new InetSocketAddress("localhost", 5000), 0))),
+			// Unknown
+			new InputChannelDeploymentDescriptor(
+				partitionIds[2],
+				ResultPartitionLocation.createUnknown()),
+			// Local
+			new InputChannelDeploymentDescriptor(
+				partitionIds[3],
+				ResultPartitionLocation.createLocal()),
+			// Local
+			new InputChannelDeploymentDescriptor(
+				partitionIds[4],
+				ResultPartitionLocation.createLocal()),
+			// Local
+			new InputChannelDeploymentDescriptor(
+				partitionIds[5],
+				ResultPartitionLocation.createLocal()),
+			// Remote
+			new InputChannelDeploymentDescriptor(
+				partitionIds[6],
+				ResultPartitionLocation.createRemote(new ConnectionID(new InetSocketAddress("localhost", 5000), 1))),
+			// Remote
+			new InputChannelDeploymentDescriptor(
+				partitionIds[7],
+				ResultPartitionLocation.createRemote(new ConnectionID(new InetSocketAddress("localhost", 5000), 2)))};
+
+		InputGateDeploymentDescriptor gateDesc =
+			new InputGateDeploymentDescriptor(new IntermediateDataSetID(),
+				ResultPartitionType.PIPELINED, new int[]{0, 4}, channelDesc, new int[]{0, 3});
+
+		int initialBackoff = 137;
+		int maxBackoff = 1001;
+
+		final NetworkEnvironment netEnv = new NetworkEnvironment(
+			100, 32, initialBackoff, maxBackoff, 2, 8, enableCreditBasedFlowControl);
+
+		SingleInputGate[] gates = SingleInputGate.create(
+			"TestTask",
+			new JobID(),
+			new ExecutionAttemptID(),
+			gateDesc,
+			netEnv,
+			new TaskEventDispatcher(),
+			new NoOpTaskActions(),
+			UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup());
+
+		try {
+			assertEquals(gateDesc.getConsumedPartitionType(), gates[0].getConsumedPartitionType());
+
+			Map<IntermediateResultPartitionID, InputChannel> channelMap0 = gates[0].getInputChannels();
+			assertEquals(3, channelMap0.size());
+			assertEquals(LocalInputChannel.class, channelMap0.get(partitionIds[0].getPartitionId()).getClass());
+			assertEquals(RemoteInputChannel.class, channelMap0.get(partitionIds[1].getPartitionId()).getClass());
+			assertEquals(UnknownInputChannel.class, channelMap0.get(partitionIds[2].getPartitionId()).getClass());
+
+			Map<IntermediateResultPartitionID, InputChannel> channelMap1 = gates[1].getInputChannels();
+			assertEquals(5, channelMap1.size());
+			assertEquals(LocalInputChannel.class, channelMap1.get(partitionIds[3].getPartitionId()).getClass());
+			assertEquals(LocalInputChannel.class, channelMap1.get(partitionIds[4].getPartitionId()).getClass());
+			assertEquals(LocalInputChannel.class, channelMap1.get(partitionIds[5].getPartitionId()).getClass());
+			assertEquals(RemoteInputChannel.class, channelMap1.get(partitionIds[6].getPartitionId()).getClass());
+			assertEquals(RemoteInputChannel.class, channelMap1.get(partitionIds[7].getPartitionId()).getClass());
+		} finally {
+			gates[0].close();
+			gates[1].close();
+			netEnv.shutdown();
 		}
 	}
 

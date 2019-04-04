@@ -18,6 +18,7 @@
 
 package org.apache.flink.runtime.executiongraph;
 
+import org.apache.commons.collections.CollectionUtils;
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.Archiveable;
 import org.apache.flink.api.common.InputDependencyConstraint;
@@ -64,6 +65,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedList;
@@ -92,6 +94,8 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 	private final Map<IntermediateResultPartitionID, IntermediateResultPartition> resultPartitions;
 
 	private final ExecutionEdge[][] inputEdges;
+	private final Map<JobEdge, ExecutionEdge[]> inputJobEdges;
+	private final DistributionPattern[] inputPattern;
 
 	private final int subTaskIndex;
 
@@ -106,6 +110,8 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 
 	/** The current or latest execution attempt of this vertex's task. */
 	private volatile Execution currentExecution;	// this field must never be null
+
+	private volatile boolean adaptiveCancelled;
 
 	// --------------------------------------------------------------------------------------------
 
@@ -165,6 +171,8 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		}
 
 		this.inputEdges = new ExecutionEdge[jobVertex.getJobVertex().getInputs().size()][];
+		this.inputJobEdges = new HashMap<>();
+		this.inputPattern = new DistributionPattern[jobVertex.getJobVertex().getInputs().size()];
 
 		this.priorExecutions = new EvictingBoundedList<>(maxPriorExecutionHistoryLength);
 
@@ -188,12 +196,23 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		getExecutionGraph().registerExecution(currentExecution);
 
 		this.timeout = timeout;
+
+		this.adaptiveCancelled = false;
 	}
 
 
 	// --------------------------------------------------------------------------------------------
 	//  Properties
 	// --------------------------------------------------------------------------------------------
+
+	public boolean isAdaptiveCancelled() {
+		return adaptiveCancelled;
+	}
+
+	public void markAdaptiveCancelled() {
+		adaptiveCancelled = true;
+		getCurrentExecutionAttempt().cancel();
+	}
 
 	public JobID getJobId() {
 		return this.jobVertex.getJobId();
@@ -372,6 +391,10 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 		}
 
 		this.inputEdges[inputNumber] = edges;
+		this.inputJobEdges.put(edge, edges);
+		this.inputPattern[inputNumber] = pattern;
+
+		LOG.debug("{}, pattern {}, source vertex {},", getTaskNameWithSubtaskIndex(), pattern, edge.getSource().getProducer().getName());
 
 		// add the consumers to the source
 		// for now (until the receiver initiated handshake is in place), we need to register the
@@ -836,24 +859,97 @@ public class ExecutionVertex implements AccessExecutionVertex, Archiveable<Archi
 			}
 		}
 
-		for (ExecutionEdge[] edges : inputEdges) {
-			InputChannelDeploymentDescriptor[] partitions = InputChannelDeploymentDescriptor.fromEdges(
-				edges,
-				targetSlot.getTaskManagerLocation().getResourceID(),
-				lazyScheduling);
+		for (int idx = 0; idx < inputEdges.length; idx++) {
+			InputChannelDeploymentDescriptor[] partitions;
+			int[] consumedIndexes;
+			int[] channelIndex;
+			IntermediateResult consumedIntermediateResult = null;
+			if (DistributionPattern.ALL_TO_ALL.equals(inputPattern[idx])) {
+				ExecutionEdge[] edges = inputEdges[idx];
 
-			// If the produced partition has multiple consumers registered, we
-			// need to request the one matching our sub task index.
-			// TODO Refactor after removing the consumers from the intermediate result partitions
-			int numConsumerEdges = edges[0].getSource().getConsumers().get(0).size();
+				partitions = InputChannelDeploymentDescriptor.fromEdges(
+					edges,
+					targetSlot.getTaskManagerLocation().getResourceID(),
+					lazyScheduling);
 
-			int queueToRequest = subTaskIndex % numConsumerEdges;
+				// If the produced partition has multiple consumers registered, we
+				// need to request the one matching our sub task index.
+				// TODO Refactor after removing the consumers from the intermediate result partitions
+				int numConsumerEdges = edges[0].getSource().getConsumers().get(0).size();
 
-			IntermediateResult consumedIntermediateResult = edges[0].getSource().getIntermediateResult();
+				List<Integer> targetIndexes = jobVertex.getTargetIndexes(subTaskIndex);
+
+				consumedIndexes = new int[targetIndexes.size()];
+				channelIndex = new int[targetIndexes.size()];
+				for (int i = 0; i < targetIndexes.size(); i++) {
+					consumedIndexes[i] = targetIndexes.get(i) % numConsumerEdges;
+					channelIndex[i] = -1;
+				}
+
+				consumedIntermediateResult = edges[0].getSource().getIntermediateResult();
+			} else if (DistributionPattern.POINTWISE.equals(inputPattern[idx])) {
+				LOG.debug("{}, POINTWISE targetIndex={}", taskNameWithSubtask, jobVertex.getTargetIndexes(subTaskIndex));
+
+				Map<Integer, List<ExecutionEdge>> allEdges = new HashMap<>();
+				ExecutionVertex[] originExecutionVertex = jobVertex.getOriginTaskVertices();
+				List<Integer> targetIndexes;
+				if (jobVertex.isPassiveComputeParallelism()) {
+					targetIndexes = new ArrayList<>(1);
+					targetIndexes.add(subTaskIndex);
+				} else {
+					targetIndexes = jobVertex.getTargetIndexes(subTaskIndex);
+				}
+
+				for (Integer targetIndex : targetIndexes) {
+					ExecutionVertex targetExecution = originExecutionVertex[targetIndex];
+					for (ExecutionEdge originEdge : targetExecution.getInputEdges(idx)) {
+						int partitionIndex = targetIndex % originEdge.getSource().getConsumers().get(0).size();
+						List<ExecutionEdge> partitionEdge = allEdges.computeIfAbsent(partitionIndex, (key) -> new ArrayList<>());
+						partitionEdge.add(originEdge);
+						LOG.debug("Partition idx={}, edge={}", partitionIndex, originEdge);
+					}
+				}
+
+				List<InputChannelDeploymentDescriptor> allPartitions = new ArrayList<>();
+				consumedIndexes = new int[allEdges.size()];
+				channelIndex = new int[allEdges.size()];
+				int partitionIdx = 0;
+				for (Map.Entry<Integer, List<ExecutionEdge>> entry : allEdges.entrySet()) {
+					ExecutionEdge[] edges = new ExecutionEdge[entry.getValue().size()];
+					edges = entry.getValue().toArray(edges);
+					InputChannelDeploymentDescriptor[] channels = InputChannelDeploymentDescriptor.fromEdges(
+						edges,
+						targetSlot.getTaskManagerLocation().getResourceID(),
+						lazyScheduling);
+
+					if (channels.length > 0) {
+						channelIndex[partitionIdx] = allPartitions.size();
+						consumedIndexes[partitionIdx] = entry.getKey();
+						partitionIdx++;
+						CollectionUtils.addAll(allPartitions, channels);
+					}
+
+					if (consumedIntermediateResult == null) {
+						consumedIntermediateResult = edges[0].getSource().getIntermediateResult();
+					}
+				}
+
+				partitions = new InputChannelDeploymentDescriptor[allPartitions.size()];
+				partitions = allPartitions.toArray(partitions);
+			} else {
+				throw new IllegalArgumentException("Undefined distribution pattern " + inputPattern[idx]);
+			}
+
 			final IntermediateDataSetID resultId = consumedIntermediateResult.getId();
 			final ResultPartitionType partitionType = consumedIntermediateResult.getResultType();
 
-			consumedPartitions.add(new InputGateDeploymentDescriptor(resultId, partitionType, queueToRequest, partitions));
+			consumedPartitions.add(new InputGateDeploymentDescriptor(resultId, partitionType, consumedIndexes,
+				partitions, channelIndex));
+
+			LOG.debug("Source vertex: {}, current execution vertex {}, InputGateDeploymentDescriptor: {}",
+				consumedIntermediateResult.getProducer().getName(),
+				getTaskNameWithSubtaskIndex(),
+				consumedPartitions.get(consumedPartitions.size() - 1).toString());
 		}
 
 		final Either<SerializedValue<JobInformation>, PermanentBlobKey> jobInformationOrBlobKey = getExecutionGraph().getJobInformationOrBlobKey();

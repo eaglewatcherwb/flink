@@ -42,6 +42,7 @@ import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
 import org.apache.flink.runtime.jobgraph.IntermediateResultPartitionID;
 import org.apache.flink.runtime.metrics.groups.TaskIOMetricGroup;
 import org.apache.flink.runtime.taskmanager.TaskActions;
+import org.apache.flink.util.Preconditions;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -660,7 +661,7 @@ public class SingleInputGate implements InputGate {
 	/**
 	 * Creates an input gate and all of its input channels.
 	 */
-	public static SingleInputGate create(
+	public static SingleInputGate[] create(
 		String owningTaskName,
 		JobID jobId,
 		ExecutionAttemptID executionId,
@@ -670,77 +671,92 @@ public class SingleInputGate implements InputGate {
 		TaskActions taskActions,
 		TaskIOMetricGroup metrics) {
 
+		final int[] subpartitionIndex = igdd.getConsumedSubpartitionIndex();
+		final int[] inputChannelIndex = igdd.getInputChannelIndex();
+
+		final SingleInputGate[] inputGates = new SingleInputGate[subpartitionIndex.length];
 		final IntermediateDataSetID consumedResultId = checkNotNull(igdd.getConsumedResultId());
 		final ResultPartitionType consumedPartitionType = checkNotNull(igdd.getConsumedPartitionType());
+		final InputChannelDeploymentDescriptor[] inputChannelDeploymentDescriptors = igdd.getInputChannelDeploymentDescriptors();
+		Preconditions.checkNotNull(inputChannelDeploymentDescriptors);
 
-		final int consumedSubpartitionIndex = igdd.getConsumedSubpartitionIndex();
-		checkArgument(consumedSubpartitionIndex >= 0);
+		for (int idx = 0; idx < subpartitionIndex.length; idx++) {
+			int consumedSubpartitionIndex = subpartitionIndex[idx];
+			checkArgument(consumedSubpartitionIndex >= 0);
 
-		final InputChannelDeploymentDescriptor[] icdd = checkNotNull(igdd.getInputChannelDeploymentDescriptors());
-
-		final SingleInputGate inputGate = new SingleInputGate(
-			owningTaskName, jobId, consumedResultId, consumedPartitionType, consumedSubpartitionIndex,
-			icdd.length, taskActions, metrics, networkEnvironment.isCreditBased());
-
-		// Create the input channels. There is one input channel for each consumed partition.
-		final InputChannel[] inputChannels = new InputChannel[icdd.length];
-
-		int numLocalChannels = 0;
-		int numRemoteChannels = 0;
-		int numUnknownChannels = 0;
-
-		for (int i = 0; i < inputChannels.length; i++) {
-			final ResultPartitionID partitionId = icdd[i].getConsumedPartitionId();
-			final ResultPartitionLocation partitionLocation = icdd[i].getConsumedPartitionLocation();
-
-			if (partitionLocation.isLocal()) {
-				inputChannels[i] = new LocalInputChannel(inputGate, i, partitionId,
-					networkEnvironment.getResultPartitionManager(),
-					taskEventPublisher,
-					networkEnvironment.getPartitionRequestInitialBackoff(),
-					networkEnvironment.getPartitionRequestMaxBackoff(),
-					metrics
-				);
-
-				numLocalChannels++;
-			}
-			else if (partitionLocation.isRemote()) {
-				inputChannels[i] = new RemoteInputChannel(inputGate, i, partitionId,
-					partitionLocation.getConnectionId(),
-					networkEnvironment.getConnectionManager(),
-					networkEnvironment.getPartitionRequestInitialBackoff(),
-					networkEnvironment.getPartitionRequestMaxBackoff(),
-					metrics
-				);
-
-				numRemoteChannels++;
-			}
-			else if (partitionLocation.isUnknown()) {
-				inputChannels[i] = new UnknownInputChannel(inputGate, i, partitionId,
-					networkEnvironment.getResultPartitionManager(),
-					taskEventPublisher,
-					networkEnvironment.getConnectionManager(),
-					networkEnvironment.getPartitionRequestInitialBackoff(),
-					networkEnvironment.getPartitionRequestMaxBackoff(),
-					metrics
-				);
-
-				numUnknownChannels++;
-			}
-			else {
-				throw new IllegalStateException("Unexpected partition location.");
+			InputChannelDeploymentDescriptor[] icdd;
+			if (inputChannelIndex[idx] == -1 || subpartitionIndex.length == 1) {
+				icdd = inputChannelDeploymentDescriptors;
+			} else {
+				int channelCnt = idx == subpartitionIndex.length - 1 ? inputChannelDeploymentDescriptors.length - inputChannelIndex[idx]
+					: inputChannelIndex[idx + 1] - inputChannelIndex[idx];
+				icdd = new InputChannelDeploymentDescriptor[channelCnt];
+				System.arraycopy(inputChannelDeploymentDescriptors, inputChannelIndex[idx], icdd, 0, channelCnt);
 			}
 
-			inputGate.setInputChannel(partitionId.getPartitionId(), inputChannels[i]);
+			final SingleInputGate inputGate = new SingleInputGate(
+				owningTaskName, jobId, consumedResultId, consumedPartitionType, consumedSubpartitionIndex,
+				icdd.length, taskActions, metrics, networkEnvironment.isCreditBased());
+
+			// Create the input channels. There is one input channel for each consumed partition.
+			final InputChannel[] inputChannels = new InputChannel[icdd.length];
+
+			int numLocalChannels = 0;
+			int numRemoteChannels = 0;
+			int numUnknownChannels = 0;
+
+			for (int i = 0; i < inputChannels.length; i++) {
+				final ResultPartitionID partitionId = icdd[i].getConsumedPartitionId();
+				final ResultPartitionLocation partitionLocation = icdd[i].getConsumedPartitionLocation();
+
+				if (partitionLocation.isLocal()) {
+					inputChannels[i] = new LocalInputChannel(inputGate, i, partitionId,
+						networkEnvironment.getResultPartitionManager(),
+						taskEventPublisher,
+						networkEnvironment.getPartitionRequestInitialBackoff(),
+						networkEnvironment.getPartitionRequestMaxBackoff(),
+						metrics
+					);
+
+					numLocalChannels++;
+				} else if (partitionLocation.isRemote()) {
+					inputChannels[i] = new RemoteInputChannel(inputGate, i, partitionId,
+						partitionLocation.getConnectionId(),
+						networkEnvironment.getConnectionManager(),
+						networkEnvironment.getPartitionRequestInitialBackoff(),
+						networkEnvironment.getPartitionRequestMaxBackoff(),
+						metrics
+					);
+
+					numRemoteChannels++;
+				} else if (partitionLocation.isUnknown()) {
+					inputChannels[i] = new UnknownInputChannel(inputGate, i, partitionId,
+						networkEnvironment.getResultPartitionManager(),
+						taskEventPublisher,
+						networkEnvironment.getConnectionManager(),
+						networkEnvironment.getPartitionRequestInitialBackoff(),
+						networkEnvironment.getPartitionRequestMaxBackoff(),
+						metrics
+					);
+
+					numUnknownChannels++;
+				} else {
+					throw new IllegalStateException("Unexpected partition location.");
+				}
+
+				inputGate.setInputChannel(partitionId.getPartitionId(), inputChannels[i]);
+			}
+			inputGates[idx] = inputGate;
+
+			LOG.debug("{}: Created {} input channels (local: {}, remote: {}, unknown: {}) consumedIndex: {}.",
+				owningTaskName,
+				inputChannels.length,
+				numLocalChannels,
+				numRemoteChannels,
+				numUnknownChannels,
+				consumedSubpartitionIndex);
 		}
 
-		LOG.debug("{}: Created {} input channels (local: {}, remote: {}, unknown: {}).",
-			owningTaskName,
-			inputChannels.length,
-			numLocalChannels,
-			numRemoteChannels,
-			numUnknownChannels);
-
-		return inputGate;
+		return inputGates;
 	}
 }

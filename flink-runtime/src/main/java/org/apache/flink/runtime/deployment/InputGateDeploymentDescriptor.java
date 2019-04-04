@@ -22,11 +22,11 @@ import org.apache.flink.runtime.io.network.partition.ResultPartitionType;
 import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
 import org.apache.flink.runtime.jobgraph.DistributionPattern;
 import org.apache.flink.runtime.jobgraph.IntermediateDataSetID;
+import org.apache.flink.util.Preconditions;
 
 import java.io.Serializable;
 import java.util.Arrays;
 
-import static org.apache.flink.util.Preconditions.checkArgument;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -54,24 +54,45 @@ public class InputGateDeploymentDescriptor implements Serializable {
 	 * The index of the consumed subpartition of each consumed partition. This index depends on the
 	 * {@link DistributionPattern} and the subtask indices of the producing and consuming task.
 	 */
-	private final int consumedSubpartitionIndex;
+	private final int[] consumedSubpartitionIndex;
 
 	/** An input channel for each consumed subpartition. */
 	private final InputChannelDeploymentDescriptor[] inputChannels;
 
+	/**
+	 * Input channel start index for each consumed subpartition index,
+	 * for {@link DistributionPattern#ALL_TO_ALL} is always -1, i.e., all the {@link inputChannels}
+	 * for {@link DistributionPattern#POINTWISE}, the channels for consumedSubpartitionIndex[i]
+	 * is inputChannels[inputChannelIndex[i]..inputChannelIndex[i+1]].
+	 */
+	private final int[] inputChannelIndex;
+
+	public InputGateDeploymentDescriptor(
+		IntermediateDataSetID consumedResultId,
+		ResultPartitionType consumedPartitionType,
+		int consumedSubpartitionIndex,
+		InputChannelDeploymentDescriptor[] inputChannels) {
+
+		this(consumedResultId, consumedPartitionType, new int[]{consumedSubpartitionIndex}, inputChannels, new int[]{-1});
+	}
+
 	public InputGateDeploymentDescriptor(
 			IntermediateDataSetID consumedResultId,
 			ResultPartitionType consumedPartitionType,
-			int consumedSubpartitionIndex,
-			InputChannelDeploymentDescriptor[] inputChannels) {
+			int[] consumedSubpartitionIndex,
+			InputChannelDeploymentDescriptor[] inputChannels,
+			int[] inputChannelIndex) {
 
 		this.consumedResultId = checkNotNull(consumedResultId);
 		this.consumedPartitionType = checkNotNull(consumedPartitionType);
 
-		checkArgument(consumedSubpartitionIndex >= 0);
-		this.consumedSubpartitionIndex = consumedSubpartitionIndex;
+		this.consumedSubpartitionIndex = checkNotNull(consumedSubpartitionIndex);
 
 		this.inputChannels = checkNotNull(inputChannels);
+
+		this.inputChannelIndex = checkNotNull(inputChannelIndex);
+
+		Preconditions.checkState(consumedSubpartitionIndex.length == inputChannelIndex.length);
 	}
 
 	public IntermediateDataSetID getConsumedResultId() {
@@ -87,8 +108,12 @@ public class InputGateDeploymentDescriptor implements Serializable {
 		return consumedPartitionType;
 	}
 
-	public int getConsumedSubpartitionIndex() {
+	public int[] getConsumedSubpartitionIndex() {
 		return consumedSubpartitionIndex;
+	}
+
+	public int[] getInputChannelIndex() {
+		return inputChannelIndex;
 	}
 
 	public InputChannelDeploymentDescriptor[] getInputChannelDeploymentDescriptors() {
@@ -98,8 +123,8 @@ public class InputGateDeploymentDescriptor implements Serializable {
 	@Override
 	public String toString() {
 		return String.format("InputGateDeploymentDescriptor [result id: %s, " +
-						"consumed subpartition index: %d, input channels: %s]",
-				consumedResultId.toString(), consumedSubpartitionIndex,
-				Arrays.toString(inputChannels));
+						"consumed subpartition index: %s, input channels: %s, channel index: %s]",
+				consumedResultId.toString(), Arrays.toString(consumedSubpartitionIndex),
+				Arrays.toString(inputChannels), Arrays.toString(inputChannelIndex));
 	}
 }

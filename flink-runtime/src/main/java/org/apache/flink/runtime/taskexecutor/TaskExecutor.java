@@ -122,6 +122,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
@@ -627,25 +628,28 @@ public class TaskExecutor extends RpcEndpoint implements TaskExecutorGateway {
 			for (final PartitionInfo partitionInfo: partitionInfos) {
 				IntermediateDataSetID intermediateResultPartitionID = partitionInfo.getIntermediateDataSetID();
 
-				final SingleInputGate singleInputGate = task.getInputGateById(intermediateResultPartitionID);
+				final Set<SingleInputGate> singleInputGates = task.getInputGateById(intermediateResultPartitionID);
 
-				if (singleInputGate != null) {
-					// Run asynchronously because it might be blocking
-					getRpcService().execute(
-						() -> {
-							try {
-								singleInputGate.updateInputChannel(partitionInfo.getInputChannelDeploymentDescriptor());
-							} catch (IOException | InterruptedException e) {
-								log.error("Could not update input data location for task {}. Trying to fail task.", task.getTaskInfo().getTaskName(), e);
+				if (singleInputGates != null) {
+					for (SingleInputGate singleInputGate : singleInputGates) {
 
+						// Run asynchronously because it might be blocking
+						getRpcService().execute(
+							() -> {
 								try {
-									task.failExternally(e);
-								} catch (RuntimeException re) {
-									// TODO: Check whether we need this or make exception in failExtenally checked
-									log.error("Failed canceling task with execution ID {} after task update failure.", executionAttemptID, re);
+									singleInputGate.updateInputChannel(partitionInfo.getInputChannelDeploymentDescriptor());
+								} catch (IOException | InterruptedException e) {
+									log.error("Could not update input data location for task {}. Trying to fail task.", task.getTaskInfo().getTaskName(), e);
+
+									try {
+										task.failExternally(e);
+									} catch (RuntimeException re) {
+										// TODO: Check whether we need this or make exception in failExtenally checked
+										log.error("Failed canceling task with execution ID {} after task update failure.", executionAttemptID, re);
+									}
 								}
-							}
-						});
+							});
+						}
 				} else {
 					return FutureUtils.completedExceptionally(
 						new PartitionException("No reader with ID " + intermediateResultPartitionID +

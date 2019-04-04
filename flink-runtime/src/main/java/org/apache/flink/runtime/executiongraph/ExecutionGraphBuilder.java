@@ -24,6 +24,7 @@ import org.apache.flink.api.common.time.Time;
 import org.apache.flink.configuration.CheckpointingOptions;
 import org.apache.flink.configuration.Configuration;
 import org.apache.flink.configuration.IllegalConfigurationException;
+import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.WebOptions;
 import org.apache.flink.metrics.MetricGroup;
 import org.apache.flink.runtime.JobException;
@@ -147,11 +148,14 @@ public class ExecutionGraphBuilder {
 		final FailoverStrategy.Factory failoverStrategy =
 				FailoverStrategyLoader.loadFailoverStrategy(jobManagerConfig, log);
 
+		Configuration jobGraphConfiguration = jobGraph.getJobConfiguration();
+		generateDefaultConfigFromJobManagerConfig(jobGraphConfiguration, jobManagerConfig);
+
 		final JobInformation jobInformation = new JobInformation(
 			jobId,
 			jobName,
 			jobGraph.getSerializedExecutionConfig(),
-			jobGraph.getJobConfiguration(),
+			jobGraphConfiguration,
 			jobGraph.getUserJarBlobKeys(),
 			jobGraph.getClasspaths());
 
@@ -368,6 +372,20 @@ public class ExecutionGraphBuilder {
 		executionGraph.getFailoverStrategy().registerMetrics(metrics);
 
 		return executionGraph;
+	}
+
+	private static void generateDefaultConfigFromJobManagerConfig(Configuration jobGraphConfiguration,
+																  Configuration jobManagerConfig) {
+		if (!jobGraphConfiguration.contains(JobManagerOptions.ENABLE_ADAPTIVE_PARALLELISM)) {
+			jobGraphConfiguration.setBoolean(JobManagerOptions.ENABLE_ADAPTIVE_PARALLELISM,
+				jobManagerConfig.getBoolean(JobManagerOptions.ENABLE_ADAPTIVE_PARALLELISM,
+					JobManagerOptions.ENABLE_ADAPTIVE_PARALLELISM.defaultValue()));
+		}
+		if (!jobGraphConfiguration.contains(JobManagerOptions.ADAPTIVE_PARALLELISM_DESIREDINPUTSIZE)) {
+			jobGraphConfiguration.setLong(JobManagerOptions.ADAPTIVE_PARALLELISM_DESIREDINPUTSIZE,
+				jobManagerConfig.getLong(JobManagerOptions.ADAPTIVE_PARALLELISM_DESIREDINPUTSIZE,
+					JobManagerOptions.ADAPTIVE_PARALLELISM_DESIREDINPUTSIZE.defaultValue()));
+		}
 	}
 
 	private static List<ExecutionJobVertex> idToVertex(

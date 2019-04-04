@@ -271,7 +271,7 @@ public class StreamNetworkBenchmarkEnvironment<T extends IOReadableWritable> {
 				channel,
 				channelDescriptors);
 
-			SingleInputGate gate = SingleInputGate.create(
+			SingleInputGate[] gate = SingleInputGate.create(
 				"receiving task[" + channel + "]",
 				jobId,
 				executionAttemptID,
@@ -281,8 +281,8 @@ public class StreamNetworkBenchmarkEnvironment<T extends IOReadableWritable> {
 				new NoOpTaskActions(),
 				UnregisteredMetricGroups.createUnregisteredTaskMetricGroup().getIOMetricGroup());
 
-			environment.setupInputGate(gate);
-			gates[channel] = gate;
+			environment.setupInputGate(gate[0]);
+			gates[channel] = gate[0];
 		}
 
 		if (channels > 1) {

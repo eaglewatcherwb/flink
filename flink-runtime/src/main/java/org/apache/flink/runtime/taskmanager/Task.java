@@ -90,7 +90,9 @@ import java.lang.reflect.InvocationTargetException;
 import java.net.URL;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
@@ -198,7 +200,7 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 
 	private final SingleInputGate[] inputGates;
 
-	private final Map<IntermediateDataSetID, SingleInputGate> inputGatesById;
+	private final Map<IntermediateDataSetID, Set<SingleInputGate>> inputGatesById;
 
 	/** Connection to the task manager. */
 	private final TaskManagerActions taskManagerActions;
@@ -395,13 +397,18 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 		}
 
 		// Consumed intermediate result partitions
-		this.inputGates = new SingleInputGate[inputGateDeploymentDescriptors.size()];
+		int totalInputGateCnt = 0;
+		for (InputGateDeploymentDescriptor inputGateDeploymentDescriptor: inputGateDeploymentDescriptors) {
+			totalInputGateCnt += inputGateDeploymentDescriptor.getConsumedSubpartitionIndex().length;
+		}
+		this.inputGates = new SingleInputGate[totalInputGateCnt];
 		this.inputGatesById = new HashMap<>();
 
 		counter = 0;
 
+		int inputGateCnt = 0;
 		for (InputGateDeploymentDescriptor inputGateDeploymentDescriptor: inputGateDeploymentDescriptors) {
-			SingleInputGate gate = SingleInputGate.create(
+			SingleInputGate[] gates = SingleInputGate.create(
 				taskNameWithSubtaskAndId,
 				jobId,
 				executionId,
@@ -410,12 +417,18 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 				taskEventDispatcher,
 				this,
 				metricGroup.getIOMetricGroup());
+			taskConfiguration.setInteger("in.groupsize." + inputGateCnt, gates.length);
+			inputGateCnt++;
 
-			inputGates[counter] = gate;
-			inputGatesById.put(gate.getConsumedResultId(), gate);
+			for (SingleInputGate gate : gates) {
+				inputGates[counter] = gate;
+				Set<SingleInputGate> inputGates = inputGatesById.computeIfAbsent(gate.getConsumedResultId(), (key) -> new HashSet<>());
+				inputGates.add(gate);
 
-			++counter;
+				++counter;
+			}
 		}
+		taskConfiguration.setInteger("in.num", counter);
 
 		invokableHasBeenCanceled = new AtomicBoolean(false);
 
@@ -463,7 +476,7 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 		return producedPartitions;
 	}
 
-	public SingleInputGate getInputGateById(IntermediateDataSetID id) {
+	public Set<SingleInputGate> getInputGateById(IntermediateDataSetID id) {
 		return inputGatesById.get(id);
 	}
 
@@ -723,6 +736,12 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 
 			// make sure the user code classloader is accessible thread-locally
 			executingThread.setContextClassLoader(userCodeClassLoader);
+
+			//*** demo code begin
+			if (taskInfo.getTaskName().contains("Reduce") || taskInfo.getTaskName().contains("DataSink")) {
+				Thread.sleep(1000L);
+			}
+			//*** demo code end
 
 			// run the invokable
 			invokable.invoke();
@@ -1263,44 +1282,46 @@ public class Task implements Runnable, TaskActions, CheckpointListener {
 			ExecutionState producerState) throws IOException, InterruptedException {
 
 		if (executionState == ExecutionState.RUNNING) {
-			final SingleInputGate inputGate = inputGatesById.get(intermediateDataSetId);
+			final Set<SingleInputGate> inputGates = inputGatesById.get(intermediateDataSetId);
 
-			if (inputGate != null) {
-				if (producerState == ExecutionState.SCHEDULED
-					|| producerState == ExecutionState.DEPLOYING
-					|| producerState == ExecutionState.RUNNING
-					|| producerState == ExecutionState.FINISHED) {
+			if (inputGates != null) {
+				for (SingleInputGate inputGate : inputGates) {
+					if (producerState == ExecutionState.SCHEDULED
+						|| producerState == ExecutionState.DEPLOYING
+						|| producerState == ExecutionState.RUNNING
+						|| producerState == ExecutionState.FINISHED) {
 
-					// Retrigger the partition request
-					inputGate.retriggerPartitionRequest(resultPartitionId.getPartitionId());
+						// Retrigger the partition request
+						inputGate.retriggerPartitionRequest(resultPartitionId.getPartitionId());
 
-				} else if (producerState == ExecutionState.CANCELING
-					|| producerState == ExecutionState.CANCELED
-					|| producerState == ExecutionState.FAILED) {
+					} else if (producerState == ExecutionState.CANCELING
+						|| producerState == ExecutionState.CANCELED
+						|| producerState == ExecutionState.FAILED) {
 
-					// The producing execution has been canceled or failed. We
-					// don't need to re-trigger the request since it cannot
-					// succeed.
-					if (LOG.isDebugEnabled()) {
-						LOG.debug("Cancelling task {} after the producer of partition {} with attempt ID {} has entered state {}.",
-							taskNameWithSubtask,
-							resultPartitionId.getPartitionId(),
+						// The producing execution has been canceled or failed. We
+						// don't need to re-trigger the request since it cannot
+						// succeed.
+						if (LOG.isDebugEnabled()) {
+							LOG.debug("Cancelling task {} after the producer of partition {} with attempt ID {} has entered state {}.",
+								taskNameWithSubtask,
+								resultPartitionId.getPartitionId(),
+								resultPartitionId.getProducerId(),
+								producerState);
+						}
+
+						cancelExecution();
+					} else {
+						// Any other execution state is unexpected. Currently, only
+						// state CREATED is left out of the checked states. If we
+						// see a producer in this state, something went wrong with
+						// scheduling in topological order.
+						String msg = String.format("Producer with attempt ID %s of partition %s in unexpected state %s.",
 							resultPartitionId.getProducerId(),
+							resultPartitionId.getPartitionId(),
 							producerState);
+
+						failExternally(new IllegalStateException(msg));
 					}
-
-					cancelExecution();
-				} else {
-					// Any other execution state is unexpected. Currently, only
-					// state CREATED is left out of the checked states. If we
-					// see a producer in this state, something went wrong with
-					// scheduling in topological order.
-					String msg = String.format("Producer with attempt ID %s of partition %s in unexpected state %s.",
-						resultPartitionId.getProducerId(),
-						resultPartitionId.getPartitionId(),
-						producerState);
-
-					failExternally(new IllegalStateException(msg));
 				}
 			} else {
 				failExternally(new IllegalStateException("Received partition producer state for " +

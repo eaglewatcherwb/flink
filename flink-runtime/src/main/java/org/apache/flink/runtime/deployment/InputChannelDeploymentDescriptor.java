@@ -20,9 +20,9 @@ package org.apache.flink.runtime.deployment;
 
 import org.apache.flink.runtime.clusterframework.types.ResourceID;
 import org.apache.flink.runtime.execution.ExecutionState;
-import org.apache.flink.runtime.executiongraph.Execution;
 import org.apache.flink.runtime.executiongraph.ExecutionEdge;
 import org.apache.flink.runtime.executiongraph.ExecutionGraphException;
+import org.apache.flink.runtime.executiongraph.ExecutionVertex;
 import org.apache.flink.runtime.executiongraph.IntermediateResultPartition;
 import org.apache.flink.runtime.io.network.ConnectionID;
 import org.apache.flink.runtime.io.network.partition.ResultPartitionID;
@@ -31,7 +31,12 @@ import org.apache.flink.runtime.io.network.partition.consumer.SingleInputGate;
 import org.apache.flink.runtime.jobmaster.LogicalSlot;
 import org.apache.flink.runtime.taskmanager.TaskManagerLocation;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
@@ -48,6 +53,8 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
 public class InputChannelDeploymentDescriptor implements Serializable {
 
 	private static final long serialVersionUID = 373711381640454080L;
+
+	static final Logger LOG = LoggerFactory.getLogger(InputChannelDeploymentDescriptor.class);
 
 	/** The ID of the partition the input channel is going to consume. */
 	private final ResultPartitionID consumedPartitionId;
@@ -87,16 +94,23 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 			ExecutionEdge[] edges,
 			ResourceID consumerResourceId,
 			boolean allowLazyDeployment) throws ExecutionGraphException {
-
-		final InputChannelDeploymentDescriptor[] icdd = new InputChannelDeploymentDescriptor[edges.length];
+		List<InputChannelDeploymentDescriptor> icddArray = new ArrayList<>(edges.length);
 
 		// Each edge is connected to a different result partition
 		for (int i = 0; i < edges.length; i++) {
 			final IntermediateResultPartition consumedPartition = edges[i].getSource();
-			final Execution producer = consumedPartition.getProducer().getCurrentExecutionAttempt();
+			final ExecutionVertex producerVertex = consumedPartition.getProducer();
 
-			final ExecutionState producerState = producer.getState();
-			final LogicalSlot producerSlot = producer.getAssignedResource();
+			if (producerVertex.isAdaptiveCancelled()) {
+				LOG.debug("Ignore input channel since source {} is cancelled",
+					producerVertex.getTaskNameWithSubtaskIndex());
+				continue;
+			} else {
+				LOG.debug("Add input channel source {}", producerVertex.getTaskNameWithSubtaskIndex());
+			}
+
+			final ExecutionState producerState = producerVertex.getCurrentExecutionAttempt().getState();
+			final LogicalSlot producerSlot = producerVertex.getCurrentExecutionAttempt().getAssignedResource();
 
 			final ResultPartitionLocation partitionLocation;
 
@@ -145,13 +159,13 @@ public class InputChannelDeploymentDescriptor implements Serializable {
 				throw new ExecutionGraphException(msg);
 			}
 
-			final ResultPartitionID consumedPartitionId = new ResultPartitionID(
-					consumedPartition.getPartitionId(), producer.getAttemptId());
+			final ResultPartitionID consumedPartitionId = new ResultPartitionID(consumedPartition.getPartitionId(),
+				producerVertex.getCurrentExecutionAttempt().getAttemptId());
 
-			icdd[i] = new InputChannelDeploymentDescriptor(
-					consumedPartitionId, partitionLocation);
+			icddArray.add(new InputChannelDeploymentDescriptor(
+					consumedPartitionId, partitionLocation));
 		}
-
-		return icdd;
+		InputChannelDeploymentDescriptor[] icdd = new InputChannelDeploymentDescriptor[icddArray.size()];
+		return icddArray.toArray(icdd);
 	}
 }
